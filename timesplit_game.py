@@ -1,28 +1,120 @@
-# timesplit_game.py — TimeSplit (Dragoncito Edition)
-# Carreras & Fútbol, splits en ms, ranking local, export CSV/XLSX, sync API.
-# Power-ups: TURBO, ESCUDO, FIREBALL, FREEZE y DRAGON (especial).
-# Audio/música: intenta cargar .ogg o .wav desde "assets/"; si no hay, el juego corre igual (fallback visual/silencioso).
+# timesplit_game.py — TimeSplit (Dragoncito Edition) + SQLite/SQLAlchemy
+# - Carreras & Fútbol
+# - Power-ups: TURBO, ESCUDO, FIREBALL, FREEZE, DRAGON
+# - Splits en ms
+# - Guarda sesión y splits en SQLite (SQLAlchemy)
+# - Ranking desde SQLite (mejor puntaje por jugador)
+# - Export CSV/XLSX por sesión
 #
 # Controles:
-# - Menú: ↑/↓ navegar · ENTER elegir · 1..6 personaje · M mute · ESC salir
-# - Juego: ENTER nueva · ESPACIO pausa · R reiniciar · TAB cambiar modo · L vuelta/periodo
-# - Guardar/Exportar: S guardar · E CSV · X Excel · U sync API
-# - Ajustes: [ y ] tick (50–1000 ms) · - y + duración (carreras o periodo fútbol)
-# - Carreras: ↑/↓ velocidad
-# - Fútbol: Flechas moverse · F chutar
+# Menú: ↑/↓ navega · ENTER elegir · 1..6 personaje · M mute · ESC salir
+# Juego: ENTER nueva · ESPACIO pausa · R reiniciar · TAB cambia modo · L vuelta/periodo
+# Guardado/Export: S guardar · E CSV · X Excel · U sync API
+# Ajustes: [ y ] tick (50–1000 ms) · - y + duración (modo)
+# Carreras: ↑/↓ velocidad
+# Fútbol: Flechas moverse · F chutar
 
-import os, json, csv, time, uuid, random, re, math
-import pygame as pg   # En Windows con Python 3.13 instala 'pygame-ce'
+import os, json, csv, time, uuid, random, re
+import pygame as pg
 import requests
-from openpyxl import Workbook
-from openpyxl.utils import get_column_letter
+from dataclasses import dataclass
+from typing import List, Dict
 
+# ---------- SQLAlchemy (SQLite) ----------
+from sqlalchemy import (
+    create_engine, Column, Integer, Float, String, Text, ForeignKey, UniqueConstraint, select, func
+)
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+
+DB_FILE = "timesplit.sqlite"
+engine = create_engine(f"sqlite:///{DB_FILE}", echo=False, future=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+Base = declarative_base()
+
+class GameSessionORM(Base):
+    __tablename__ = "sessions"
+    id = Column(String, primary_key=True)           # uid
+    player = Column(String, nullable=False)
+    mode = Column(String, nullable=False)           # "carreras" | "futbol"
+    started_at = Column(Integer, nullable=False)    # epoch ms
+    duration_ms = Column(Integer, nullable=False)
+    total_score = Column(Float, nullable=False)
+    splits = relationship("SplitORM", cascade="all, delete-orphan", back_populates="session")
+
+class SplitORM(Base):
+    __tablename__ = "splits"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(String, ForeignKey("sessions.id", ondelete="CASCADE"), index=True)
+    t_ms = Column(Integer, nullable=False)
+    lap = Column(Integer, nullable=False)
+    score = Column(Float, nullable=False)
+    note = Column(Text, nullable=True)
+    session = relationship("GameSessionORM", back_populates="splits")
+    __table_args__ = (UniqueConstraint('session_id','id', name='uix_session_id_id'),)
+
+def orm_init_db():
+    Base.metadata.create_all(engine)
+
+def orm_upsert_session_with_splits(payload: Dict):
+    """
+    Inserta/actualiza la sesión (por id) y *reemplaza* todos sus splits:
+    - si existe, borra los splits anteriores y reescribe
+    - si no existe, crea la sesión con sus splits
+    """
+    with SessionLocal() as db:
+        sid = payload["id"]
+        ses = db.get(GameSessionORM, sid)
+        if not ses:
+            ses = GameSessionORM(
+                id=sid,
+                player=payload["player"],
+                mode=payload["mode"],
+                started_at=int(payload["startedAt"]),
+                duration_ms=int(payload["durationMs"]),
+                total_score=float(payload["totalScore"])
+            )
+            db.add(ses)
+        else:
+            ses.player = payload["player"]
+            ses.mode = payload["mode"]
+            ses.started_at = int(payload["startedAt"])
+            ses.duration_ms = int(payload["durationMs"])
+            ses.total_score = float(payload["totalScore"])
+            # borrar splits previos
+            ses.splits.clear()
+
+        for sp in payload.get("splits", []):
+            ses.splits.append(SplitORM(
+                session_id=sid,
+                t_ms=int(sp["t"]),
+                lap=int(sp["lap"]),
+                score=float(sp["score"]),
+                note=sp.get("note")
+            ))
+        db.commit()
+
+def orm_leaderboard_best_by_player(mode: str, limit: int = 10) -> List[Dict]:
+    """
+    Devuelve [{player, best_score}] ordenado desc, mejor total_score por jugador para 'mode'.
+    """
+    with SessionLocal() as db:
+        stmt = (
+            select(GameSessionORM.player, func.max(GameSessionORM.total_score).label("best"))
+            .where(GameSessionORM.mode == mode)
+            .group_by(GameSessionORM.player)
+            .order_by(func.max(GameSessionORM.total_score).desc())
+            .limit(limit)
+        )
+        rows = db.execute(stmt).all()
+        return [{"player": r[0], "best_score": float(r[1])} for r in rows]
+
+# ---------- Pygame / Juego ----------
 WIDTH, HEIGHT = 960, 540
 FPS = 60
 ASSETS_DIR = "assets"
 
-# ---------- Utilidades ----------
 def uid(prefix="s"):
+    import uuid
     return f"{prefix}_{uuid.uuid4().hex[:8]}"
 
 def fmt_ms(ms: int) -> str:
@@ -33,85 +125,56 @@ def fmt_ms(ms: int) -> str:
     return f"{mm:02d}:{ss:02d}.{cs:02d}"
 
 def safe_filename(text: str) -> str:
+    import re
     name = re.sub(r'[\\/:*?"<>|]+', "_", text)
     return name.strip().strip(".")
 
+@dataclass
 class Split:
-    __slots__ = ("t","score","lap","note")
-    def __init__(self, t, score, lap, note=None):
-        self.t = int(t)
-        self.score = round(float(score), 2)
-        self.lap = int(lap)
-        self.note = note
+    t: int
+    score: float
+    lap: int
+    note: str | None = None
 
 class Session:
     def __init__(self, player: str, mode: str):
         self.id = uid()
         self.player = player or "Jugador/a"
-        self.mode = mode  # "carreras" | "futbol"
+        self.mode = mode
         self.startedAt = int(time.time()*1000)
         self.totalScore = 0.0
         self.durationMs = 0
-        self.splits: list[Split] = []
+        self.splits: List[Split] = []
 
-# ---------- Persistencia / Export ----------
-def save_session(session: Session) -> dict:
-    """Guarda/actualiza la sesión en sessions.json y devuelve un dict serializable."""
-    key_path = "sessions.json"
-    try:
-        with open(key_path, "r", encoding="utf-8") as f:
-            arr = json.load(f)
-    except:
-        arr = []
+# ---- Export por sesión (CSV/XLSX) ----
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
 
-    payload = {
-        "id": session.id,
-        "player": session.player,
-        "mode": session.mode,
-        "startedAt": session.startedAt,
-        "totalScore": round(session.totalScore, 2),
-        "durationMs": session.durationMs,
-        "splits": [{"t": s.t, "score": s.score, "lap": s.lap, "note": s.note} for s in session.splits],
-    }
-
-    arr = [p for p in arr if p.get("id") != session.id]
-    arr.insert(0, payload)
-    with open(key_path, "w", encoding="utf-8") as f:
-        json.dump(arr, f, ensure_ascii=False, indent=2)
-    return payload
-
-def load_sessions() -> list[dict]:
-    try:
-        with open("sessions.json", "r", encoding="utf-8") as f:
-            return json.load(f)
-    except:
-        return []
-
-def export_csv(session_payload: dict) -> str:
+def export_csv(payload: dict) -> str:
     rows = [["player","mode","startedAt","durationMs","totalScore","t(ms)","lap","score","note"]]
-    for sp in session_payload["splits"]:
+    for sp in payload["splits"]:
         rows.append([
-            session_payload["player"], session_payload["mode"],
-            time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(session_payload["startedAt"]/1000)),
-            str(session_payload["durationMs"]),
-            str(session_payload["totalScore"]),
+            payload["player"], payload["mode"],
+            time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(payload["startedAt"]/1000)),
+            str(payload["durationMs"]),
+            str(payload["totalScore"]),
             str(sp["t"]), str(sp["lap"]), str(sp["score"]), sp.get("note") or ""
         ])
-    player_safe = safe_filename(session_payload['player'])
-    fname = f"timesplit_{session_payload['mode']}_{player_safe}_{session_payload['startedAt']}.csv"
+    player_safe = safe_filename(payload['player'])
+    fname = f"timesplit_{payload['mode']}_{player_safe}_{payload['startedAt']}.csv"
     with open(fname, "w", newline="", encoding="utf-8") as f:
         csv.writer(f).writerows(rows)
     return fname
 
-def export_xlsx(session_payload: dict, participants: list[dict]) -> str:
+def export_xlsx(payload: dict, participants: List[dict]) -> str:
     wb = Workbook()
     ws1 = wb.active; ws1.title = "Resumen"
     ws1.append(["Campo", "Valor"])
-    ws1.append(["Jugador", session_payload["player"]])
-    ws1.append(["Modo", session_payload["mode"]])
-    ws1.append(["Inicio", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(session_payload["startedAt"]/1000))])
-    ws1.append(["Duración (ms)", session_payload["durationMs"]])
-    ws1.append(["Puntaje total", session_payload["totalScore"]])
+    ws1.append(["Jugador", payload["player"]])
+    ws1.append(["Modo", payload["mode"]])
+    ws1.append(["Inicio", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(payload["startedAt"]/1000))])
+    ws1.append(["Duración (ms)", payload["durationMs"]])
+    ws1.append(["Puntaje total", payload["totalScore"]])
     ws1.append([])
     ws1.append(["Participante","Rol","Marca"])
     for p in participants:
@@ -121,24 +184,19 @@ def export_xlsx(session_payload: dict, participants: list[dict]) -> str:
 
     ws2 = wb.create_sheet("Splits")
     ws2.append(["t (ms)", "lap/periodo", "score", "note"])
-    for sp in session_payload["splits"]:
+    for sp in payload["splits"]:
         ws2.append([sp["t"], sp["lap"], sp["score"], sp.get("note") or ""])
     for col in range(1, 5):
         ws2.column_dimensions[get_column_letter(col)].width = 18
 
-    player_safe = safe_filename(session_payload['player'])
-    fname = f"timesplit_{session_payload['mode']}_{player_safe}_{session_payload['startedAt']}.xlsx"
+    player_safe = safe_filename(payload['player'])
+    fname = f"timesplit_{payload['mode']}_{player_safe}_{payload['startedAt']}.xlsx"
     wb.save(fname)
     return fname
 
-def sync_to_api(session_payload: dict, api_url: str) -> tuple[bool, str]:
-    """POST a la API con x-api-key opcional (TSR_API_KEY)."""
+# ---- Opcional: Sync API ----
+def sync_to_api(payload: dict, api_url: str) -> tuple[bool, str]:
     try:
-        payload = dict(session_payload)
-        payload["splits"] = [
-            {"t": sp["t"], "score": sp["score"], "lap": sp["lap"], "note": sp.get("note")}
-            for sp in session_payload.get("splits", [])
-        ]
         headers = {"Content-Type": "application/json"}
         api_key = os.getenv("TSR_API_KEY")
         if api_key:
@@ -148,7 +206,7 @@ def sync_to_api(session_payload: dict, api_url: str) -> tuple[bool, str]:
     except Exception as e:
         return False, str(e)
 
-# ---------- Recursos ----------
+# ---- Recursos gráficos/sonoros ----
 def load_img(name, scale=None):
     path = os.path.join(ASSETS_DIR, name)
     try:
@@ -160,9 +218,9 @@ def load_img(name, scale=None):
         return None
 
 def load_snd(name, volume=0.6):
-    """Intenta .ogg y .wav con el mismo nombre base."""
     if not pg.mixer.get_init():
         return None
+    # admite .ogg o .wav alternadamente
     for candidate in (name, os.path.splitext(name)[0] + ".wav", os.path.splitext(name)[0] + ".ogg"):
         path = os.path.join(ASSETS_DIR, candidate)
         if os.path.exists(path):
@@ -174,14 +232,14 @@ def load_snd(name, volume=0.6):
                 continue
     return None
 
-# ---------- Juego ----------
+# ---- Constantes de juego ----
 CHARACTERS = [
     {"name":"Aqua",  "color": ( 60,200,255)},
     {"name":"Lime",  "color": ( 80,220,120)},
     {"name":"Rose",  "color": (235, 80,140)},
     {"name":"Gold",  "color": (245,200, 40)},
     {"name":"Violet","color": (170, 95,255)},
-    {"name":"Dragoncito","color": (100,200,100)},  # 💚
+    {"name":"Dragoncito","color": (100,200,100)},  # usa assets/dragon.png si existe
 ]
 BOT_NAMES_RACE = ["Bot-Alpha","Bot-Bravo","Bot-Charlie","Bot-Delta","Bot-Echo"]
 BOT_NAMES_FOOT = ["Rival-1","Rival-2","Rival-3","Compi-1","Compi-2"]
@@ -190,12 +248,16 @@ PU_TURBO   = "TURBO"
 PU_SHIELD  = "ESCUDO"
 PU_FIRE    = "FIREBALL"
 PU_FREEZE  = "FREEZE"
-PU_DRAGON  = "DRAGON"   # especial
+PU_DRAGON  = "DRAGON"
 
 class Game:
     def __init__(self):
+        # DB ready
+        orm_init_db()
+
+        # Pygame
         pg.init()
-        pg.display.set_caption("TimeSplit — Dragoncito Edition")
+        pg.display.set_caption("TimeSplit — Dragoncito Edition (SQLite)")
         self.screen = pg.display.set_mode((WIDTH, HEIGHT))
         self.clock = pg.time.Clock()
         self.font = pg.font.SysFont("consolas,arial", 18)
@@ -207,24 +269,20 @@ class Game:
             pg.mixer.init()
         except Exception:
             pass
-
         self.snd_pick  = load_snd("s_pick.ogg", 0.7)  or load_snd("s_pick.wav", 0.7)
         self.snd_shoot = load_snd("s_shoot.ogg", 0.7) or load_snd("s_shoot.wav", 0.7)
         self.snd_goal  = load_snd("s_goal.ogg", 0.8)  or load_snd("s_goal.wav", 0.8)
         self.music_current = None
 
-        # pantalla
+        # Estados
         self.screen_state = "menu"
-
-        # Config
         self.player_name = "Jugador/a"
         self.mode = "carreras"
         self.tick_ms = 200
-        self.target_duration_s = 60   # carreras
-        self.half_duration_s = 45     # fútbol (cada periodo, hay 2)
+        self.target_duration_s = 60
+        self.half_duration_s = 45
         self.api_url = os.getenv("TSR_API") or "http://localhost:3000/api/sessions"
 
-        # Estado
         self.running = False
         self.elapsed_ms = 0
         self.score = 0.0
@@ -237,11 +295,11 @@ class Game:
         self.message_ttl = 0
 
         # Personajes
-        self.char_idx = 0
+        self.char_idx = 5  # arranco con Dragoncito 💚 por tu pedido
         self.player_color = CHARACTERS[self.char_idx]["color"]
         self.player_label = CHARACTERS[self.char_idx]["name"]
 
-        # Sprites (opcional; si no están, hay fallback de formas)
+        # Sprites
         self.img_car_player = load_img("car_player.png", (64,32))
         self.img_car_bot    = load_img("car_bot.png",    (64,32))
 
@@ -255,7 +313,8 @@ class Game:
         self.img_pu_fire    = load_img("pu_fire.png",   (18,18))
         self.img_pu_freeze  = load_img("pu_freeze.png", (18,18))
 
-        self.img_dragon     = load_img("dragon.png", (48,48))  # si existe en assets, lo usa
+        # 👉 imagen del Dragoncito (usada en fútbol y como adorno en autos)
+        self.img_dragon     = load_img("dragon.png", (48,48))
 
         # Carreras
         self.speed = 20.0
@@ -269,7 +328,7 @@ class Game:
         self.npcs: list[dict] = []
         self._init_football_npcs()
 
-        # Powerups
+        # Power-ups
         self.powerups: list[dict] = []
         self.active_pu: dict[str, dict] = {}
         self.next_pu_spawn_ms = 4000
@@ -278,7 +337,7 @@ class Game:
         self.menu_idx = 0
         self.menu_items = ["Jugar: Carreras", "Jugar: Fútbol", "Cambiar Personaje", "Salir"]
 
-    # ---------- Música ----------
+    # -------- Música --------
     def music_play(self, filename, vol=0.45):
         if not pg.mixer.get_init() or self.muted:
             return
@@ -302,7 +361,7 @@ class Game:
         except Exception: pass
         self.music_current = None
 
-    # ---------- UI helpers ----------
+    # -------- UI helpers --------
     def play(self, sound):
         if self.muted or not sound: return
         try: sound.play()
@@ -313,18 +372,17 @@ class Game:
         self.message_ttl = ttl
         print(text)
 
-    # ---------- Inicialización de bots ----------
+    # -------- Inicialización --------
     def _init_race_bots(self):
+        import random
         self.cars = []
         lanes = [HEIGHT*0.30, HEIGHT*0.38, HEIGHT*0.46, HEIGHT*0.54, HEIGHT*0.62]
         random.shuffle(lanes)
-        # jugador
         self.cars.append({
             "name": f"{self.player_label} ({self.player_name})",
             "color": self.player_color,
             "x": 60, "y": lanes[0], "speed": self.speed, "dist": 0.0, "is_player": True
         })
-        # bots
         for i in range(1, min(5, len(lanes))):
             self.cars.append({
                 "name": BOT_NAMES_RACE[i-1],
@@ -337,27 +395,24 @@ class Game:
             })
 
     def _init_football_npcs(self):
+        import random
         self.npcs = []
-        # 3 rivales
         for i in range(3):
             self.npcs.append({
                 "name": BOT_NAMES_FOOT[i],
                 "color": (210,80,80),
-                "pos": pg.Vector2(random.randint(WIDTH//2+40, WIDTH-60),
-                                  random.randint(60, HEIGHT-60)),
+                "pos": pg.Vector2(random.randint(WIDTH//2+40, WIDTH-60), random.randint(60, HEIGHT-60)),
                 "role": "rival"
             })
-        # 2 compañeros
         for i in range(2):
             self.npcs.append({
                 "name": BOT_NAMES_FOOT[3+i],
                 "color": (80,180,250),
-                "pos": pg.Vector2(random.randint(60, WIDTH//2-60),
-                                  random.randint(60, HEIGHT-60)),
+                "pos": pg.Vector2(random.randint(60, WIDTH//2-60), random.randint(60, HEIGHT-60)),
                 "role": "ally"
             })
 
-    # ---------- Sesión ----------
+    # -------- Sesión --------
     def start_session(self):
         self.session = Session(self.player_name, self.mode)
         self.running = True
@@ -369,7 +424,6 @@ class Game:
         self.powerups.clear()
         self.active_pu.clear()
         self.next_pu_spawn_ms = 2500
-        # posiciones
         self.player_pos.update(120, HEIGHT/2)
         self.ball_pos.update(WIDTH/2, HEIGHT/2)
         self.ball_vel.update(0,0)
@@ -387,9 +441,23 @@ class Game:
         limit = self.get_limit_ms()
         self.session.totalScore = round(self.score, 2)
         self.session.durationMs = max(self.elapsed_ms, limit)
-        payload = save_session(self.session)
+        payload = {
+            "id": self.session.id,
+            "player": self.session.player,
+            "mode": self.session.mode,
+            "startedAt": self.session.startedAt,
+            "durationMs": self.session.durationMs,
+            "totalScore": self.session.totalScore,
+            "splits": [{"t": s.t, "score": s.score, "lap": s.lap, "note": s.note} for s in self.session.splits],
+        }
         self.last_saved_payload = payload
-        self.info("Sesión guardada en sessions.json")
+
+        # Guardar en SQLite (upsert sesión + reemplazo completo de splits)
+        try:
+            orm_upsert_session_with_splits(payload)
+            self.info("Guardado en SQLite (timesplit.sqlite)")
+        except Exception as e:
+            self.info(f"Error al guardar en SQLite: {e}")
 
     def reset(self):
         self.running = False
@@ -408,9 +476,9 @@ class Game:
     def get_limit_ms(self):
         return int(self.target_duration_s*1000) if self.mode=="carreras" else int(self.half_duration_s*2*1000)
 
-    # ---------- Power-ups ----------
+    # -------- Power-ups --------
     def spawn_powerup(self):
-        # 10% prob. DRAGON
+        import random
         if random.random() < 0.10:
             ptype = PU_DRAGON
         else:
@@ -441,11 +509,9 @@ class Game:
         return bool(x and self.elapsed_ms <= x["until"])
 
     def update_powerups(self, dt_ms: int):
-        # spawner
         if self.elapsed_ms >= self.next_pu_spawn_ms:
             self.spawn_powerup()
             self.next_pu_spawn_ms += random.randint(4000, 7000)
-        # recogida
         if self.mode == "carreras":
             player_car = self.cars[0]
             ppos = pg.Vector2(player_car["x"] % (WIDTH+80) - 40, player_car["y"])
@@ -460,27 +526,25 @@ class Game:
                 if self.player_pos.distance_to(pu["pos"]) < 28:
                     pu["active"] = False
                     self.pickup_powerup(pu["type"])
-        # limpieza
         for k in list(self.active_pu.keys()):
             if self.elapsed_ms > self.active_pu[k]["until"]:
                 del self.active_pu[k]
 
-    # ---------- Lógica ----------
+    # -------- Lógica --------
     def step_carreras(self, dt_ms: int):
-        turbo = self.is_pu_active(PU_TURBO) or self.is_pu_active(PU_DRAGON)
         shield = self.is_pu_active(PU_SHIELD) or self.is_pu_active(PU_DRAGON)
         for car in self.cars:
             if car["is_player"]:
                 base = self.speed
                 boost = 0.60 if self.is_pu_active(PU_TURBO) else 0.0
                 if self.is_pu_active(PU_DRAGON):
-                    boost = 1.20  # dragoncito = turbo bestial
+                    boost = 1.20
                 car["speed"] = base * (1.0 + boost)
             else:
                 car["speed"] += random.uniform(-0.6, 0.6)
                 car["speed"] = max(10, min(32, car["speed"]))
             car["x"] += car["speed"] * (dt_ms/28.0)
-            fr = 0.995 if shield else 0.985  # con escudo/dragon, menos fricción
+            fr = 0.995 if shield else 0.985
             car["dist"] = car["dist"]*fr + car["speed"] * (dt_ms/1000.0)
             if car["x"] > WIDTH + 40:
                 car["x"] = -40
@@ -489,8 +553,6 @@ class Game:
     def step_futbol(self, dt_ms: int):
         dt = dt_ms/16.0
         frozen = self.is_pu_active(PU_FREEZE)
-
-        # NPCs
         for npc in self.npcs:
             jitter = pg.Vector2(random.uniform(-1.2,1.2), random.uniform(-1.2,1.2))
             speed = 2.5 * (0.4 if frozen else 1.0)
@@ -498,7 +560,6 @@ class Game:
             npc["pos"].x = max(20, min(WIDTH-20, npc["pos"].x))
             npc["pos"].y = max(20, min(HEIGHT-20, npc["pos"].y))
 
-        # balón
         self.ball_vel *= 0.993
         self.ball_pos += self.ball_vel * dt
         if self.ball_pos.y < 12 or self.ball_pos.y > HEIGHT-12:
@@ -528,7 +589,7 @@ class Game:
             if self.is_pu_active(PU_FIRE):
                 power *= 1.6
             if self.is_pu_active(PU_DRAGON):
-                power *= 2.0  # dragoncito patea fuerte
+                power *= 2.0
             v = diff.normalize() * (power*20)
             self.ball_vel += v
             self.register_event("SHOT")
@@ -544,8 +605,8 @@ class Game:
             self.last_tick = self.elapsed_ms + dt_ms
             self.session.splits.append(Split(self.elapsed_ms + dt_ms, self.score, self.lap, None))
 
-    # ---------- Export helpers ----------
-    def participants_summary(self) -> list[dict]:
+    # -------- Export helpers --------
+    def participants_summary(self) -> List[dict]:
         if self.mode == "carreras":
             arr = sorted(self.cars, key=lambda c: c["dist"], reverse=True)
             return [{"name": c["name"], "role": "player" if c["is_player"] else "bot", "mark": round(c["dist"],2)} for c in arr]
@@ -555,7 +616,7 @@ class Game:
                 {"name": "Rivales", "role":"bot", "mark": int(self.enemy_score)},
             ]
 
-    # ---------- Dibujo ----------
+    # -------- Dibujo --------
     def draw(self):
         s = self.screen
         s.fill((8,12,20))
@@ -566,24 +627,22 @@ class Game:
             return
 
         if self.mode == "carreras":
-            # pista
             pg.draw.rect(s,(35,35,35),(0, HEIGHT*0.25, WIDTH, HEIGHT*0.5))
             for x in range(0, WIDTH, 40):
                 pg.draw.rect(s,(240,240,240),(x, HEIGHT*0.5-2, 20, 4))
             pg.draw.rect(s,(220,30,70),(WIDTH-10, HEIGHT*0.25, 10, HEIGHT*0.5))
-            # autos
             for car in self.cars:
                 x = car["x"] % (WIDTH+80) - 40
                 y = car["y"] - 16
                 if car["is_player"] and self.img_car_player:
                     s.blit(self.img_car_player, (x, y))
+                    # adorno dragon si personaje seleccionado es Dragoncito
                     if self.player_label == "Dragoncito" and self.img_dragon:
-                        s.blit(self.img_dragon, (x-2, y-26))  # adornito 💚
+                        s.blit(self.img_dragon, (x-2, y-26))
                 elif (not car["is_player"]) and self.img_car_bot:
                     s.blit(self.img_car_bot, (x, y))
                 else:
                     pg.draw.rect(s, car["color"], (x, y, 44, 32), border_radius=6)
-            # powerups
             for pu in self.powerups:
                 if not pu["active"]: continue
                 pos = (int(pu["pos"].x), int(pu["pos"].y))
@@ -599,7 +658,6 @@ class Game:
                     if pu["type"]==PU_DRAGON: color = (255,215,100)
                     pg.draw.circle(s, color, pos, 10)
         else:
-            # cancha
             pg.draw.rect(s,(10,120,60),(0,0,WIDTH,HEIGHT))
             pg.draw.rect(s,(255,255,255),(6,6,WIDTH-12,HEIGHT-12),2)
             pg.draw.line(s,(255,255,255),(WIDTH/2,6),(WIDTH/2,HEIGHT-6),2)
@@ -607,14 +665,13 @@ class Game:
             goal_top, goal_bot = HEIGHT*0.35, HEIGHT*0.65
             pg.draw.rect(s,(255,255,255),(0, goal_top, 6, goal_bot-goal_top),2)
             pg.draw.rect(s,(255,255,255),(WIDTH-6, goal_top, 6, goal_bot-goal_top),2)
-            # jugador
+            # jugador con dragon.png si existe y el personaje es Dragoncito
             if self.player_label == "Dragoncito" and self.img_dragon:
                 s.blit(self.img_dragon, (int(self.player_pos.x)-24, int(self.player_pos.y)-24))
             elif self.img_player:
                 s.blit(self.img_player, (int(self.player_pos.x)-11, int(self.player_pos.y)-11))
             else:
                 pg.draw.circle(s, self.player_color, (int(self.player_pos.x), int(self.player_pos.y)), 10)
-            # NPCs
             for npc in self.npcs:
                 pos = (int(npc["pos"].x), int(npc["pos"].y))
                 if npc["role"] == "ally" and self.img_npc_ally:
@@ -623,12 +680,10 @@ class Game:
                     s.blit(self.img_npc_enemy, (pos[0]-8, pos[1]-8))
                 else:
                     pg.draw.circle(s, npc["color"], pos, 9 if npc["role"]=="ally" else 7)
-            # balón
             if self.img_ball:
                 s.blit(self.img_ball, (int(self.ball_pos.x)-6, int(self.ball_pos.y)-6))
             else:
                 pg.draw.circle(s,(255,255,255),(int(self.ball_pos.x), int(self.ball_pos.y)), 6)
-            # powerups
             for pu in self.powerups:
                 if not pu["active"]: continue
                 pos = (int(pu["pos"].x), int(pu["pos"].y))
@@ -665,38 +720,29 @@ class Game:
             s.blit(self.big.render(self.message, True, (255,230,90)), (14, HEIGHT-40))
             self.message_ttl -= 1
 
-        self.draw_ranking()
+        self.draw_ranking_from_db()
         pg.display.flip()
 
-    def draw_ranking(self):
-        sessions = load_sessions()
-        filtered = [s for s in sessions if s.get("mode")==self.mode]
-        best_by_player = {}
-        for s in filtered:
-            k = s["player"]
-            if k not in best_by_player or s["totalScore"] > best_by_player[k]["totalScore"]:
-                best_by_player[k] = s
-        arr = sorted(best_by_player.values(), key=lambda x: x["totalScore"], reverse=True)[:10]
+    def draw_ranking_from_db(self):
+        arr = orm_leaderboard_best_by_player(self.mode, 10)
         x0, y0 = WIDTH-360, 120
         box = pg.Rect(x0-16, y0-16, 340, 260)
         pg.draw.rect(self.screen, (25,25,40), box, border_radius=12)
         pg.draw.rect(self.screen, (70,70,90), box, 2, border_radius=12)
-        title = self.big.render("Ranking local (Top 10)", True, (240,240,255))
+        title = self.big.render("Ranking (SQLite) Top 10", True, (240,240,255))
         self.screen.blit(title, (x0, y0-12))
         for i, s in enumerate(arr):
-            line = f"{i+1:>2}  {s['player']:<12}  {s['totalScore']:.2f}"
+            line = f"{i+1:>2}  {s['player']:<12}  {s['best_score']:.2f}"
             txt = self.font.render(line, True, (220,220,235))
             self.screen.blit(txt, (x0, y0+24 + i*22))
 
-    # ---------- Menú ----------
+    # -------- Menú --------
     def draw_menu(self):
         s = self.screen
         s.fill((10, 14, 28))
         self.music_play("music_menu.ogg", 0.5)
-
-        title = self.big.render("TimeSplit — Menú Principal (Dragoncito)", True, (240,240,255))
+        title = self.big.render("TimeSplit — Menú Principal (Dragoncito + SQLite)", True, (240,240,255))
         s.blit(title, (WIDTH//2 - title.get_width()//2, 60))
-
         for i, it in enumerate(self.menu_items):
             is_sel = (i == self.menu_idx)
             r = pg.Rect(WIDTH//2 - 200, 150 + i*60, 400, 46)
@@ -705,10 +751,8 @@ class Game:
                 pg.draw.rect(s, (120,160,255), r, 3, border_radius=10)
             txt = self.font.render(it, True, (230,235,245))
             s.blit(txt, (r.x + 16, r.y + 12))
-
-        sub = self.font.render(f"Personaje actual: {self.player_label}  (1..6 para cambiar aquí también)", True, (200,210,230))
+        sub = self.font.render(f"Personaje actual: {self.player_label}  (1..6 para cambiar)", True, (200,210,230))
         s.blit(sub, (WIDTH//2 - sub.get_width()//2, HEIGHT - 100))
-
         help_txt = self.font.render("↑/↓ Navegar  |  ENTER Elegir  |  M Mutear  |  ESC Salir", True, (200,210,230))
         s.blit(help_txt, (WIDTH//2 - help_txt.get_width()//2, HEIGHT - 60))
 
@@ -735,7 +779,7 @@ class Game:
                 elif "Salir" in choice:
                     pg.event.post(pg.event.Event(pg.QUIT))
 
-    # ---------- Input ----------
+    # -------- Input --------
     def handle_input(self):
         keys = pg.key.get_pressed()
         if self.screen_state == "menu":
@@ -833,31 +877,25 @@ class Game:
                         self.music_play("music_race.ogg" if self.mode=="carreras" else "music_football.ogg", 0.45)
         return True
 
-    # ---------- Bucle principal ----------
+    # -------- Bucle --------
     def run(self):
         last = pg.time.get_ticks()
         while True:
             if not self.process_events():
                 break
             self.handle_input()
-
             now = pg.time.get_ticks()
             dt = now - last
             last = now
 
             if self.screen_state == "game" and self.running and self.session:
                 self.elapsed_ms += dt
-
-                # ciclo powerups
                 self.update_powerups(dt)
-
                 if self.mode == "carreras":
                     self.step_carreras(dt)
                 else:
                     self.step_futbol(dt)
-
                 self.maybe_split(dt)
-
                 if self.elapsed_ms >= self.get_limit_ms():
                     self.finish_session()
 
