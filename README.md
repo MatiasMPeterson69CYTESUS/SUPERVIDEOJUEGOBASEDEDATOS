@@ -112,33 +112,65 @@ outcome
 Permite calcular variaciones de ranking por partida.
 
 ⚙️ Instalación y ejecución (Ubuntu)
+
 1️⃣ Clonar el repositorio
+
+
 git clone https://github.com/tu-usuario/timesplit.git
+
+
 cd timesplit
 
+
+
 2️⃣ Crear entorno virtual
+
+
 python3 -m venv venv
+
+
 source venv/bin/activate
 
+
 3️⃣ Instalar dependencias
+
 pip install -r requirements.txt
+
+
 
 4️⃣ Configurar variables de entorno
 
+
+
 Crear archivo .env en la raíz del proyecto:
 
+
+
 DATABASE_URL=postgresql://usuario:password@localhost:5432/timesplit
+
+
 TSR_PLAYER=Jugador/a
+
+
 
 
 ⚠️ Si PostgreSQL no está disponible, el juego usará SQLite automáticamente.
 
+
+
 5️⃣ Ejecutar el juego
+
+
 python timesplit_game.py
+
 
 🧠 Ranking Glicko-2
 
+
+
 El sistema Glicko-2 se aplica después de cada match y actualiza:
+
+
 
 Rating
 
@@ -175,7 +207,11 @@ Distribución de rating por modo de juego
 
 Todas las consultas se basan exclusivamente en Glicko-2.
 
+
+
 📁 Estructura del proyecto
+
+
 timesplit/
 │
 ├── timesplit_game.py
