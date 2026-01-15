@@ -81,6 +81,8 @@ gender
 org_id
 
 matches
+
+
 Registra cada enfrentamiento:
 
 modo (carreras / fútbol)
@@ -211,7 +213,6 @@ Todas las consultas se basan exclusivamente en Glicko-2.
 
 📁 Estructura del proyecto
 
-
 timesplit/
 │
 ├── timesplit_game.py
@@ -221,6 +222,8 @@ timesplit/
 │   └── dragon.png
 ├── venv/
 └── README.md
+
+
 
 🎓 Contexto académico
 
