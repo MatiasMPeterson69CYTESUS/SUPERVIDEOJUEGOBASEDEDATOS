@@ -1,218 +1,174 @@
-🎮 TimeSplit — Dragoncito Edition
-PostgreSQL + Glicko-2 Ranking System
 
-TimeSplit es un videojuego desarrollado en Python (pygame) que integra un sistema de ranking Glicko-2 persistente sobre PostgreSQL, permitiendo registrar partidas, sesiones y eventos del juego, y posteriormente responder consultas SQL avanzadas para análisis estadístico y ranking competitivo.
 
-Este proyecto fue desarrollado como parte de un trabajo académico de Bases de Datos, cumpliendo con requerimientos de persistencia, modelado relacional y consultas analíticas.
+# 🎮 TimeSplit — Dragoncito Edition
 
-🚀 Características principales
+### PostgreSQL + Glicko-2 Ranking System
 
-🎮 Juego interactivo en Python (pygame)
+TimeSplit es un videojuego desarrollado en **Python (pygame)** que integra un **sistema de ranking Glicko-2** persistente sobre **PostgreSQL**, permitiendo registrar partidas, sesiones y eventos del juego, y posteriormente responder consultas SQL avanzadas para análisis estadístico y ranking competitivo.
 
-🐉 Personaje jugable “Dragoncito”
+Este proyecto fue desarrollado como parte de un **trabajo académico de Bases de Datos**, cumpliendo con requerimientos de persistencia, modelado relacional y consultas analíticas.
 
-🏁 Modos de juego:
+---
 
-Carreras
+## 🚀 Características principales
 
-Fútbol
+* 🎮 Juego interactivo en Python (pygame)
+* 🐉 Personaje jugable “Dragoncito”
+* 🏁 Modos de juego:
 
-🧠 Sistema de ranking Glicko-2
+  * Carreras
+  * Fútbol
+* 🧠 Sistema de ranking **Glicko-2**
 
-Rating
+  * Rating
+  * Rating Deviation (RD)
+  * Volatilidad (vol)
+* 🗄️ Persistencia completa en **PostgreSQL**
+* 📊 Consultas SQL para informes:
 
-Rating Deviation (RD)
+  * Top 10 ranking
+  * Historial de partidas
+  * Variaciones de rating
+  * Estadísticas por organización
+  * Winrate por jugador
+  * Distribución por modo de juego
+* 🔁 Fallback automático a SQLite si PostgreSQL no está disponible
+* 📦 Entorno reproducible con `venv` + `requirements.txt`
 
-Volatilidad (vol)
+---
 
-🗄️ Persistencia completa en PostgreSQL
+## 🧱 Arquitectura del proyecto
 
-📊 Consultas SQL para informes:
+### 🐍 Backend / Juego (Python)
 
-Top 10 ranking
+* `timesplit_game.py`
+  Archivo principal del juego.
+  Incluye:
 
-Historial de partidas
+  * Lógica del juego (pygame)
+  * Integración con base de datos vía **SQLAlchemy**
+  * Cálculo y actualización de Glicko-2
+  * Pantalla de ranking Top 10
 
-Variaciones de rating
-
-Estadísticas por organización
-
-Winrate por jugador
-
-Distribución por modo de juego
-
-🔁 Fallback automático a SQLite si PostgreSQL no está disponible
-
-📦 Entorno reproducible con venv + requirements.txt
-
-🧱 Arquitectura del proyecto
-🐍 Backend / Juego (Python)
-
-timesplit_game.py
-Archivo principal del juego.
-Incluye:
-
-Lógica del juego (pygame)
-
-Integración con base de datos vía SQLAlchemy
-
-Cálculo y actualización de Glicko-2
-
-Pantalla de ranking Top 10
-
-🗄️ Base de Datos (PostgreSQL)
+### 🗄️ Base de Datos (PostgreSQL)
 
 El juego genera y utiliza las siguientes tablas:
 
-organizations
-Agrupa jugadores por club/organización.
+* **organizations**
+  Agrupa jugadores por club/organización.
 
-players
-Guarda los parámetros Glicko-2:
+* **players**
+  Guarda los parámetros Glicko-2:
 
-rating
+  * `rating`
+  * `rd`
+  * `vol`
+  * `gender`
+  * `org_id`
 
-rd
+* **matches**
+  Registra cada enfrentamiento:
 
-vol
+  * modo (carreras / fútbol)
+  * jugadores
+  * scores
+  * ganador
+  * timestamp (`played_at` en epoch ms)
 
-gender
+* **game_sessions**
+  Representa una sesión de juego completa.
 
-org_id
+* **splits**
+  Eventos temporales dentro de una sesión (telemetría).
 
-matches
+* **match_player_stats**
+  Tabla clave para el informe:
 
+  * rating_before / rating_after
+  * rd_before / rd_after
+  * vol_before / vol_after
+  * outcome
+    Permite calcular variaciones de ranking por partida.
 
-Registra cada enfrentamiento:
+---
 
-modo (carreras / fútbol)
+## ⚙️ Instalación y ejecución (Ubuntu)
 
-jugadores
+### 1️⃣ Clonar el repositorio
 
-scores
-
-ganador
-
-timestamp (played_at en epoch ms)
-
-game_sessions
-Representa una sesión de juego completa.
-
-splits
-Eventos temporales dentro de una sesión (telemetría).
-
-match_player_stats
-Tabla clave para el informe:
-
-rating_before / rating_after
-
-rd_before / rd_after
-
-vol_before / vol_after
-
-outcome
-Permite calcular variaciones de ranking por partida.
-
-⚙️ Instalación y ejecución (Ubuntu)
-
-1️⃣ Clonar el repositorio
-
-
+```bash
 git clone https://github.com/tu-usuario/timesplit.git
-
-
 cd timesplit
+```
 
+### 2️⃣ Crear entorno virtual
 
-
-2️⃣ Crear entorno virtual
-
-
+```bash
 python3 -m venv venv
-
-
 source venv/bin/activate
+```
 
+### 3️⃣ Instalar dependencias
 
-3️⃣ Instalar dependencias
-
+```bash
 pip install -r requirements.txt
+```
 
+### 4️⃣ Configurar variables de entorno
 
+Crear archivo `.env` en la raíz del proyecto:
 
-4️⃣ Configurar variables de entorno
-
-
-
-Crear archivo .env en la raíz del proyecto:
-
-
-
+```env
 DATABASE_URL=postgresql://usuario:password@localhost:5432/timesplit
-
-
 TSR_PLAYER=Jugador/a
+```
 
+> ⚠️ Si PostgreSQL no está disponible, el juego usará SQLite automáticamente.
 
+### 5️⃣ Ejecutar el juego
 
-
-⚠️ Si PostgreSQL no está disponible, el juego usará SQLite automáticamente.
-
-
-
-5️⃣ Ejecutar el juego
-
-
+```bash
 python timesplit_game.py
+```
 
+---
 
-🧠 Ranking Glicko-2
+## 🧠 Ranking Glicko-2
 
+El sistema Glicko-2 se aplica **después de cada match** y actualiza:
 
-
-El sistema Glicko-2 se aplica después de cada match y actualiza:
-
-
-
-Rating
-
-RD
-
-Volatilidad
+* Rating
+* RD
+* Volatilidad
 
 El ranking se puede:
 
-📊 Consultar vía SQL
+* 📊 Consultar vía SQL
+* 🎮 Visualizar directamente en el juego desde
+  **“Ver Ranking (Glicko-2)”**
 
-🎮 Visualizar directamente en el juego desde
-“Ver Ranking (Glicko-2)”
+---
 
-📊 Consultas SQL (Informe)
+## 📊 Consultas SQL (Informe)
 
 El modelo de datos permite responder consultas como:
 
-Top 10 jugadores por ranking global
+* Top 10 jugadores por ranking global
+* Historial de partidas por jugador
+* Cambios de rating por match
+* Variación de rating en el último mes
+* Estadísticas por organización
+* Ranking femenino
+* Winrate por jugador
+* Distribución de rating por modo de juego
 
-Historial de partidas por jugador
+Todas las consultas se basan **exclusivamente en Glicko-2**.
 
-Cambios de rating por match
+---
 
-Variación de rating en el último mes
+## 📁 Estructura del proyecto
 
-Estadísticas por organización
-
-Ranking femenino
-
-Winrate por jugador
-
-Distribución de rating por modo de juego
-
-Todas las consultas se basan exclusivamente en Glicko-2.
-
-
-
-📁 Estructura del proyecto
-
+```
 timesplit/
 │
 ├── timesplit_game.py
@@ -222,24 +178,25 @@ timesplit/
 │   └── dragon.png
 ├── venv/
 └── README.md
+```
 
+---
 
+## 🎓 Contexto académico
 
-🎓 Contexto académico
+Proyecto desarrollado para una asignatura de **Bases de Datos**, cumpliendo con:
 
-Proyecto desarrollado para una asignatura de Bases de Datos, cumpliendo con:
+* Modelado relacional
+* Persistencia real
+* Uso de PostgreSQL
+* Consultas SQL analíticas
+* Integración completa con una aplicación real
 
-Modelado relacional
+---
 
-Persistencia real
-
-Uso de PostgreSQL
-
-❤️ Créditos
+## ❤️ Créditos
 
 Desarrollado por Sebastian Acuña Concha y Matias Peterson Solis
 Dragoncito Edition 🐉✨
 
-Consultas SQL analíticas
-
-Integración completa con una aplicación real
+---
